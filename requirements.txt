@@ -1,0 +1,5 @@
+PyMuPDF==1.27.2
+fastapi
+python-multipart
+uvicorn
+websockets

@@ -1,0 +1,11 @@
+[default]
+company_name = "삼성전자"
+
+[windows]
+output_dir = "~/Documents"
+
+[macos]
+output_dir = "~/Documents"
+
+[linux]
+output_dir = "~/Documents"
