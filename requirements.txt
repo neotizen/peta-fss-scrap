@@ -1,5 +1,6 @@
 PyMuPDF==1.27.2
 fastapi
+jinja2
 python-multipart
 uvicorn
 websockets
