@@ -1,4 +1,4 @@
-app = "pjt-fss-scrap"
+app = "peta-fss-scrap"
 primary_region = "nrt"
 
 [env]

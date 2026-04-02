@@ -1893,6 +1893,12 @@ def populate_output_pdf(
             )
         detail_url, attachments, main_dcm_no = fetch_report_detail(session, disclosure)
         disclosure.attachment_docs = attachments
+        if log_stream is not None:
+            if attachments:
+                print(f"    본문 1건 + 첨부 {len(attachments)}건 처리 예정", file=log_stream)
+            else:
+                print("    본문만 처리 예정", file=log_stream)
+            print("    본문 다운로드/병합 중...", file=log_stream)
 
         sources = fetch_pdf_sources(
             session,
@@ -1902,6 +1908,8 @@ def populate_output_pdf(
             label="본문",
             cancel_requested=cancel_requested,
         )
+        if log_stream is not None and len(sources) > 1:
+            print(f"    본문 소스 {len(sources)}건 병합 중...", file=log_stream)
         for source in sources:
             append_pdf_with_header(
                 output_doc,
@@ -1910,9 +1918,14 @@ def populate_output_pdf(
                 cancel_requested=cancel_requested,
             )
 
-        for attachment in attachments:
+        for attachment_index, attachment in enumerate(attachments, start=1):
             raise_if_cancel_requested(cancel_requested)
             attachment_detail_url = f"/dsaf001/main.do?rcpNo={attachment.rcp_no}&dcmNo={attachment.dcm_no}"
+            if log_stream is not None:
+                print(
+                    f"    첨부 {attachment_index}/{len(attachments)} 다운로드/병합 중: {attachment.title}",
+                    file=log_stream,
+                )
             attachment_sources = fetch_pdf_sources(
                 session,
                 detail_url=attachment_detail_url,
@@ -1921,6 +1934,11 @@ def populate_output_pdf(
                 label=attachment.title,
                 cancel_requested=cancel_requested,
             )
+            if log_stream is not None and len(attachment_sources) > 1:
+                print(
+                    f"    첨부 {attachment_index}/{len(attachments)} 소스 {len(attachment_sources)}건 병합 중...",
+                    file=log_stream,
+                )
             for source in attachment_sources:
                 append_pdf_with_header(
                     output_doc,
@@ -1950,6 +1968,8 @@ def build_output_pdf(
             cancel_requested=cancel_requested,
         )
         raise_if_cancel_requested(cancel_requested)
+        if log_stream is not None:
+            print(f"[저장] 최종 PDF 저장 중... (총 {output_doc.page_count}페이지)", file=log_stream)
         output_doc.save(
             output_path,
             garbage=4,
@@ -1978,6 +1998,8 @@ def build_output_pdf_bytes(
             cancel_requested=cancel_requested,
         )
         raise_if_cancel_requested(cancel_requested)
+        if log_stream is not None:
+            print(f"[저장] 최종 PDF 바이트 생성 중... (총 {output_doc.page_count}페이지)", file=log_stream)
         return output_doc.tobytes(
             garbage=4,
             deflate=True,
