@@ -27,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent
 TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 app = FastAPI(title="DART Disclosure PDF Builder")
 JOB_RETENTION_SECONDS = 3600
-JOB_OUTPUT_DIR = Path("/tmp/peta-fss-scrap-jobs")
+JOB_OUTPUT_DIR = Path(tempfile.gettempdir()) / "peta-fss-scrap-jobs"
 JOB_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CURRENT_MACHINE_ID = os.getenv("FLY_MACHINE_ID")
 CURRENT_APP_NAME = os.getenv("FLY_APP_NAME")
@@ -367,6 +367,7 @@ def build_generation_command(
         end_date,
         "--output-dir",
         str(output_dir),
+        "--include-attachments",
         "--no-prompt",
     ]
     if limit is not None:

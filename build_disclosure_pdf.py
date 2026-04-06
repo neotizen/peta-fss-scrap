@@ -4,7 +4,6 @@ from __future__ import annotations
 import atexit
 import argparse
 import base64
-import hashlib
 import html
 import io
 import json
@@ -18,11 +17,10 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 import zipfile
 from http.client import RemoteDisconnected
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Iterable
@@ -30,6 +28,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin
 from urllib.request import HTTPCookieProcessor, ProxyHandler, Request, build_opener, getproxies
 import http.cookiejar
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
+    import tomli as tomllib
 
 try:
     from websockets.exceptions import ConnectionClosed
@@ -80,6 +83,7 @@ TODAY = datetime.today()
 DEFAULT_COMPANY_NAME = "삼성전자"
 DEFAULT_START_DATE = TODAY.strftime("%Y-01-01")
 DEFAULT_END_DATE = TODAY.strftime("%Y-%m-%d")
+DEFAULT_SPLIT_MAX_MB = 199
 CONFIG_PATH = APP_DIR / "config.toml"
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -99,9 +103,6 @@ BROWSER_START_TIMEOUT_SECONDS = 10.0
 BROWSER_COMMAND_TIMEOUT_SECONDS = 30.0
 BROWSER_LOCK_WAIT_SECONDS = 0.2
 BROWSER_PAGE_LOAD_TIMEOUT_SECONDS = 10.0
-CACHE_LOCK_WAIT_SECONDS = 0.2
-PDF_SOURCE_CACHE_VERSION = 1
-REPORT_DETAIL_CACHE_VERSION = 1
 HTML_PDF_RENDERER_BROWSER = "browser"
 HTML_PDF_RENDERER_FITZ = "fitz"
 HTML_PDF_RENDERER_AUTO = "auto"
@@ -203,31 +204,10 @@ class DisclosureBatch:
 class AppConfig:
     company_name: str
     output_dir: str
-    cache_dir: str
 
 
 def default_output_dir() -> str:
     return str(Path.home() / "Documents")
-
-
-def default_cache_dir() -> str:
-    env_cache_dir = normalized_env_value("DART_CACHE_DIR")
-    if env_cache_dir:
-        return env_cache_dir
-
-    system_name = platform.system()
-    if system_name == "Windows":
-        local_app_data = os.getenv("LOCALAPPDATA")
-        if local_app_data:
-            return str(Path(local_app_data) / "dart-disclosure-pdf-builder" / "cache")
-        return str(Path.home() / "AppData" / "Local" / "dart-disclosure-pdf-builder" / "cache")
-    if system_name == "Darwin":
-        return str(Path.home() / "Library" / "Caches" / "dart-disclosure-pdf-builder")
-
-    xdg_cache_home = os.getenv("XDG_CACHE_HOME")
-    if xdg_cache_home:
-        return str(Path(xdg_cache_home).expanduser() / "dart-disclosure-pdf-builder")
-    return str(Path.home() / ".cache" / "dart-disclosure-pdf-builder")
 
 
 def platform_config_section_name() -> str | None:
@@ -255,7 +235,7 @@ def merge_config_section(merged: dict[str, str], section: object, *, section_nam
         return
     if not isinstance(section, dict):
         raise RuntimeError(f"config.toml의 [{section_name}] 섹션은 테이블이어야 합니다.")
-    for key in ("company_name", "output_dir", "cache_dir"):
+    for key in ("company_name", "output_dir"):
         normalized = normalize_config_value(section.get(key), label=f"[{section_name}].{key}")
         if normalized is not None:
             merged[key] = normalized
@@ -277,8 +257,7 @@ def load_app_config(config_path: Path = CONFIG_PATH) -> AppConfig:
 
     company_name = merged.get("company_name", DEFAULT_COMPANY_NAME)
     output_dir = merged.get("output_dir", default_output_dir())
-    cache_dir = merged.get("cache_dir", default_cache_dir())
-    return AppConfig(company_name=company_name, output_dir=output_dir, cache_dir=cache_dir)
+    return AppConfig(company_name=company_name, output_dir=output_dir)
 
 
 def normalized_env_value(name: str) -> str | None:
@@ -316,6 +295,11 @@ REMOTE_DISCONNECT_RETRY_DELAY_SECONDS = max(
     RETRY_DELAY_SECONDS,
     env_float("DART_REMOTE_DISCONNECT_RETRY_DELAY_SECONDS", 12.0),
 )
+DOWNLOAD_LINK_RETRY_COUNT = max(1, env_int("DART_DOWNLOAD_LINK_RETRY_COUNT", 2))
+DOWNLOAD_LINK_RETRY_DELAY_SECONDS = max(
+    0.0,
+    env_float("DART_DOWNLOAD_LINK_RETRY_DELAY_SECONDS", 2.0),
+)
 
 
 def current_html_pdf_renderer_mode() -> str:
@@ -325,13 +309,6 @@ def current_html_pdf_renderer_mode() -> str:
         if normalized in VALID_HTML_PDF_RENDERERS:
             return normalized
     return HTML_PDF_RENDERER_BROWSER
-
-
-def pdf_source_cache_renderer_variant() -> str:
-    mode = current_html_pdf_renderer_mode()
-    if mode == HTML_PDF_RENDERER_AUTO:
-        return HTML_PDF_RENDERER_BROWSER
-    return mode
 
 
 def apply_proxy_env_aliases() -> None:
@@ -434,6 +411,23 @@ class SimpleTableParser(HTMLParser):
             self._buffer.append(data)
         if self._in_target_select and self._current_option_value is not None:
             self._buffer.append(data)
+
+
+class DownloadLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.paths: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        attr_map = {name.lower(): value for name, value in attrs}
+        href = attr_map.get("href")
+        if not href:
+            return
+        resolved = html.unescape(href)
+        if resolved.startswith("/pdf/download/pdf.do?") or resolved.startswith("/pdf/download/zip.do?"):
+            self.paths.append(resolved)
 
 
 class DartSession:
@@ -607,6 +601,49 @@ def prompt_date(prompt_label: str, default_value: str) -> str:
         return value
 
 
+def prompt_yes_no(prompt_label: str, default_value: bool) -> bool:
+    default_text = "y" if default_value else "n"
+    while True:
+        entered = input(f"{prompt_label} [y/n] [{default_text}]: ").strip().lower()
+        value = entered or default_text
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        print("y 또는 n으로 입력해 주세요.", file=sys.stderr)
+
+
+def prompt_output_dir(base_output_dir: str) -> str:
+    base_path = Path(base_output_dir).expanduser()
+    entered = input(f"저장 하위 폴더 [{base_path}, 비워두면 기본 경로]: ").strip()
+    if not entered:
+        return str(base_path)
+    candidate = Path(entered).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+    return str(base_path / candidate)
+
+
+def prompt_split_max_mb(default_value: int | None) -> int | None:
+    default_text = str(default_value) if default_value is not None else "n"
+    while True:
+        entered = input(
+            f"분할 저장 크기 (MB, n=분할 안 함) [{default_text}]: "
+        ).strip().lower()
+        value = entered or default_text
+        if value in {"n", "no"}:
+            return None
+        try:
+            parsed = int(value)
+        except ValueError:
+            print("숫자(MB) 또는 n으로 입력해 주세요.", file=sys.stderr)
+            continue
+        if parsed < 1:
+            print("분할 크기는 1MB 이상의 정수여야 합니다.", file=sys.stderr)
+            continue
+        return parsed
+
+
 def resolve_args(args: argparse.Namespace, config: AppConfig) -> argparse.Namespace:
     interactive = sys.stdin.isatty() and not args.no_prompt
     args.auto_output = args.output is None
@@ -615,6 +652,8 @@ def resolve_args(args: argparse.Namespace, config: AppConfig) -> argparse.Namesp
     start_date = args.start_date or DEFAULT_START_DATE
     end_date = args.end_date or DEFAULT_END_DATE
     output_dir = args.output_dir or config.output_dir
+    include_attachments = bool(getattr(args, "include_attachments", False))
+    split_max_mb = None if getattr(args, "no_split", False) else getattr(args, "split_max_mb", None)
 
     if interactive:
         print("공시 조회 조건을 입력하세요. Enter를 누르면 기본값을 사용합니다.", file=sys.stderr)
@@ -626,12 +665,17 @@ def resolve_args(args: argparse.Namespace, config: AppConfig) -> argparse.Namesp
                 break
             print("조회 종료일은 조회 시작일보다 빠를 수 없습니다.", file=sys.stderr)
         if args.output is None:
-            output_dir = prompt_text("저장 폴더", output_dir)
+            output_dir = prompt_output_dir(output_dir)
+        include_attachments = prompt_yes_no("첨부 문서도 포함할까요?", include_attachments)
+        if split_max_mb is None and not getattr(args, "no_split", False):
+            split_max_mb = prompt_split_max_mb(DEFAULT_SPLIT_MAX_MB)
 
     args.company_name = company_name
     args.start_date = start_date
     args.end_date = end_date
     args.output_dir = output_dir
+    args.include_attachments = include_attachments
+    args.split_max_mb = split_max_mb
 
     if args.auto_output:
         args.output = str(build_output_path(company_name, start_date, end_date, output_dir))
@@ -718,10 +762,16 @@ def parse_stock_code(html_text: str) -> str:
 
 
 def parse_main_dcm_no(html_text: str, rcp_no: str) -> str:
-    match = re.search(rf"openPdfDownload\('{re.escape(rcp_no)}', '(\d+)'\)", html_text)
-    if not match:
-        raise RuntimeError(f"본문 dcmNo를 찾지 못했습니다: rcpNo={rcp_no}")
-    return match.group(1)
+    patterns = [
+        rf"openPdfDownload\(\s*['\"]{re.escape(rcp_no)}['\"]\s*,\s*['\"](\d+)['\"]\s*\)",
+        rf"viewDoc\(\s*['\"]{re.escape(rcp_no)}['\"]\s*,\s*['\"](\d+)['\"]\s*,",
+        rf"openReportViewer(?:Main|Param|Keyword|ListViewer)?\(\s*['\"]{re.escape(rcp_no)}['\"]\s*,\s*['\"](\d+)['\"]",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text)
+        if match:
+            return match.group(1)
+    raise RuntimeError(f"본문 dcmNo를 찾지 못했습니다: rcpNo={rcp_no}")
 
 
 def parse_attachment_docs(html_text: str) -> list[AttachmentDoc]:
@@ -748,20 +798,36 @@ def parse_attachment_docs(html_text: str) -> list[AttachmentDoc]:
 
 
 def parse_pdf_download_paths(html_text: str) -> list[str]:
-    paths = re.findall(r'href="(/pdf/download/pdf\.do\?[^"]+)"', html_text)
-    return [html.unescape(path) for path in paths]
+    parser = DownloadLinkParser()
+    parser.feed(html_text)
+    return [path for path in parser.paths if path.startswith("/pdf/download/pdf.do?")]
 
 
 def parse_zip_download_paths(html_text: str) -> list[str]:
-    paths = re.findall(r'href="(/pdf/download/zip\.do\?[^"]+)"', html_text)
-    return [html.unescape(path) for path in paths]
+    parser = DownloadLinkParser()
+    parser.feed(html_text)
+    return [path for path in parser.paths if path.startswith("/pdf/download/zip.do?")]
 
 
 def parse_download_assets(html_text: str) -> list[DownloadAsset]:
+    parser = DownloadLinkParser()
+    parser.feed(html_text)
     assets: list[DownloadAsset] = []
-    assets.extend(DownloadAsset(kind="pdf", path=path) for path in parse_pdf_download_paths(html_text))
-    assets.extend(DownloadAsset(kind="zip", path=path) for path in parse_zip_download_paths(html_text))
+    assets.extend(DownloadAsset(kind="pdf", path=path) for path in parser.paths if path.startswith("/pdf/download/pdf.do?"))
+    assets.extend(DownloadAsset(kind="zip", path=path) for path in parser.paths if path.startswith("/pdf/download/zip.do?"))
     return assets
+
+
+def summarize_download_page(html_text: str) -> str:
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html_text, flags=re.I | re.S)
+    title = normalize_space(title_match.group(1)) if title_match else ""
+    body_text = clean_html_text(html_text)
+    snippets: list[str] = []
+    if title:
+        snippets.append(f"title={title}")
+    if body_text:
+        snippets.append(f"body={body_text[:160]}")
+    return ", ".join(snippets)
 
 
 def resolve_html_pdf_browser() -> str | None:
@@ -780,12 +846,20 @@ def resolve_html_pdf_browser() -> str | None:
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
         ]
     elif system_name == "Windows":
+        local_app_data = os.getenv("LOCALAPPDATA")
         path_candidates = [
             r"C:\Program Files\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
             r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
             r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
         ]
+        if local_app_data:
+            path_candidates.extend(
+                [
+                    str(Path(local_app_data) / "Google" / "Chrome" / "Application" / "chrome.exe"),
+                    str(Path(local_app_data) / "Microsoft" / "Edge" / "Application" / "msedge.exe"),
+                ]
+            )
     else:
         path_candidates = []
 
@@ -1114,253 +1188,8 @@ class BrowserPdfRenderer:
             return json.loads(raw_message)
 
 
-class PdfSourceCache:
-    def __init__(self, root_dir: Path) -> None:
-        self.root_dir = root_dir
-        self._locks: dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
-
-    def load(
-        self,
-        *,
-        rcp_no: str,
-        dcm_no: str,
-        label: str,
-        renderer_mode: str,
-    ) -> list[PdfSource] | None:
-        cache_path = self._entry_path(
-            rcp_no=rcp_no,
-            dcm_no=dcm_no,
-            label=label,
-            renderer_mode=renderer_mode,
-        )
-        if not cache_path.exists():
-            return None
-        try:
-            return self._read_entry(cache_path)
-        except Exception:
-            cache_path.unlink(missing_ok=True)
-            return None
-
-    def store(
-        self,
-        sources: list[PdfSource],
-        *,
-        rcp_no: str,
-        dcm_no: str,
-        label: str,
-        renderer_mode: str,
-    ) -> None:
-        cache_path = self._entry_path(
-            rcp_no=rcp_no,
-            dcm_no=dcm_no,
-            label=label,
-            renderer_mode=renderer_mode,
-        )
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            dir=cache_path.parent,
-            prefix=f"{cache_path.stem}-",
-            suffix=".tmp",
-            delete=False,
-        ) as temp_file:
-            temp_path = Path(temp_file.name)
-        try:
-            with zipfile.ZipFile(temp_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                manifest_items: list[dict[str, str]] = []
-                for index, source in enumerate(sources, start=1):
-                    filename = f"source-{index:03d}.pdf"
-                    archive.writestr(filename, source.bytes_data)
-                    manifest_items.append({"filename": filename, "label": source.label})
-                archive.writestr(
-                    "manifest.json",
-                    json.dumps(
-                        {
-                            "cache_version": PDF_SOURCE_CACHE_VERSION,
-                            "created_at": datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z"),
-                            "items": manifest_items,
-                        },
-                        ensure_ascii=False,
-                    ).encode("utf-8"),
-                )
-            os.replace(temp_path, cache_path)
-        finally:
-            temp_path.unlink(missing_ok=True)
-
-    def acquire_entry_lock(
-        self,
-        *,
-        rcp_no: str,
-        dcm_no: str,
-        label: str,
-        renderer_mode: str,
-        cancel_requested: Callable[[], bool] | None = None,
-    ) -> threading.Lock:
-        key = self._entry_key(
-            rcp_no=rcp_no,
-            dcm_no=dcm_no,
-            label=label,
-            renderer_mode=renderer_mode,
-        )
-        with self._locks_guard:
-            lock = self._locks.setdefault(key, threading.Lock())
-        while not lock.acquire(timeout=CACHE_LOCK_WAIT_SECONDS):
-            raise_if_cancel_requested(cancel_requested)
-        return lock
-
-    def _entry_path(self, *, rcp_no: str, dcm_no: str, label: str, renderer_mode: str) -> Path:
-        key = self._entry_key(
-            rcp_no=rcp_no,
-            dcm_no=dcm_no,
-            label=label,
-            renderer_mode=renderer_mode,
-        )
-        return self.root_dir / key[:2] / f"{key}.zip"
-
-    def _entry_key(self, *, rcp_no: str, dcm_no: str, label: str, renderer_mode: str) -> str:
-        payload = json.dumps(
-            {
-                "cache_version": PDF_SOURCE_CACHE_VERSION,
-                "rcp_no": rcp_no,
-                "dcm_no": dcm_no,
-                "label": label,
-                "renderer_mode": renderer_mode,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        ).encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
-
-    def _read_entry(self, cache_path: Path) -> list[PdfSource]:
-        with zipfile.ZipFile(cache_path) as archive:
-            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
-            if manifest.get("cache_version") != PDF_SOURCE_CACHE_VERSION:
-                raise RuntimeError("캐시 버전이 일치하지 않습니다.")
-            items = manifest.get("items")
-            if not isinstance(items, list) or not items:
-                raise RuntimeError("캐시 항목이 비어 있습니다.")
-
-            sources: list[PdfSource] = []
-            for item in items:
-                if not isinstance(item, dict):
-                    raise RuntimeError("캐시 항목 형식이 올바르지 않습니다.")
-                filename = item.get("filename")
-                label = item.get("label")
-                if not isinstance(filename, str) or not isinstance(label, str):
-                    raise RuntimeError("캐시 항목 메타데이터가 올바르지 않습니다.")
-                pdf_bytes = archive.read(filename)
-                if not pdf_bytes.startswith(b"%PDF"):
-                    raise RuntimeError(f"캐시 PDF 형식이 올바르지 않습니다: {filename}")
-                sources.append(PdfSource(bytes_data=pdf_bytes, label=label))
-            return sources
-
-
-class ReportDetailCache:
-    def __init__(self, root_dir: Path) -> None:
-        self.root_dir = root_dir
-        self._locks: dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
-
-    def load(self, *, rcp_no: str) -> ReportDetail | None:
-        cache_path = self._entry_path(rcp_no=rcp_no)
-        if not cache_path.exists():
-            return None
-        try:
-            return self._read_entry(cache_path)
-        except Exception:
-            cache_path.unlink(missing_ok=True)
-            return None
-
-    def store(self, detail: ReportDetail, *, rcp_no: str) -> None:
-        cache_path = self._entry_path(rcp_no=rcp_no)
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            dir=cache_path.parent,
-            prefix=f"{cache_path.stem}-",
-            suffix=".tmp",
-            delete=False,
-        ) as temp_file:
-            temp_path = Path(temp_file.name)
-        try:
-            payload = {
-                "cache_version": REPORT_DETAIL_CACHE_VERSION,
-                "main_dcm_no": detail.main_dcm_no,
-                "attachments": [
-                    {
-                        "rcp_no": attachment.rcp_no,
-                        "dcm_no": attachment.dcm_no,
-                        "title": attachment.title,
-                    }
-                    for attachment in detail.attachments
-                ],
-            }
-            temp_path.write_text(
-                json.dumps(payload, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            os.replace(temp_path, cache_path)
-        finally:
-            temp_path.unlink(missing_ok=True)
-
-    def acquire_entry_lock(
-        self,
-        *,
-        rcp_no: str,
-        cancel_requested: Callable[[], bool] | None = None,
-    ) -> threading.Lock:
-        key = self._entry_key(rcp_no=rcp_no)
-        with self._locks_guard:
-            lock = self._locks.setdefault(key, threading.Lock())
-        while not lock.acquire(timeout=CACHE_LOCK_WAIT_SECONDS):
-            raise_if_cancel_requested(cancel_requested)
-        return lock
-
-    def _entry_path(self, *, rcp_no: str) -> Path:
-        key = self._entry_key(rcp_no=rcp_no)
-        return self.root_dir / "report-detail" / key[:2] / f"{key}.json"
-
-    def _entry_key(self, *, rcp_no: str) -> str:
-        payload = json.dumps(
-            {
-                "cache_version": REPORT_DETAIL_CACHE_VERSION,
-                "rcp_no": rcp_no,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        ).encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
-
-    def _read_entry(self, cache_path: Path) -> ReportDetail:
-        payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        if payload.get("cache_version") != REPORT_DETAIL_CACHE_VERSION:
-            raise RuntimeError("detail 캐시 버전이 일치하지 않습니다.")
-
-        main_dcm_no = payload.get("main_dcm_no")
-        attachments_raw = payload.get("attachments")
-        if not isinstance(main_dcm_no, str) or not main_dcm_no:
-            raise RuntimeError("detail 캐시 main_dcm_no가 올바르지 않습니다.")
-        if not isinstance(attachments_raw, list):
-            raise RuntimeError("detail 캐시 attachments가 올바르지 않습니다.")
-
-        attachments: list[AttachmentDoc] = []
-        for item in attachments_raw:
-            if not isinstance(item, dict):
-                raise RuntimeError("detail 캐시 attachment 항목 형식이 올바르지 않습니다.")
-            rcp_no = item.get("rcp_no")
-            dcm_no = item.get("dcm_no")
-            title = item.get("title")
-            if not isinstance(rcp_no, str) or not isinstance(dcm_no, str) or not isinstance(title, str):
-                raise RuntimeError("detail 캐시 attachment 메타데이터가 올바르지 않습니다.")
-            attachments.append(AttachmentDoc(rcp_no=rcp_no, dcm_no=dcm_no, title=title))
-        return ReportDetail(main_dcm_no=main_dcm_no, attachments=attachments)
-
-
 _BROWSER_PDF_RENDERER: BrowserPdfRenderer | None = None
 _BROWSER_PDF_RENDERER_GUARD = threading.Lock()
-_PDF_SOURCE_CACHE: PdfSourceCache | None = None
-_PDF_SOURCE_CACHE_GUARD = threading.Lock()
-_REPORT_DETAIL_CACHE: ReportDetailCache | None = None
-_REPORT_DETAIL_CACHE_GUARD = threading.Lock()
 
 
 def close_browser_pdf_renderer() -> None:
@@ -1389,15 +1218,6 @@ def get_browser_pdf_renderer() -> BrowserPdfRenderer | None:
         return _BROWSER_PDF_RENDERER
 
 
-def get_report_detail_cache() -> ReportDetailCache:
-    global _REPORT_DETAIL_CACHE
-    with _REPORT_DETAIL_CACHE_GUARD:
-        if _REPORT_DETAIL_CACHE is None:
-            app_config = load_app_config()
-            _REPORT_DETAIL_CACHE = ReportDetailCache(Path(app_config.cache_dir).expanduser())
-        return _REPORT_DETAIL_CACHE
-
-
 def prewarm_browser_pdf_renderer(
     *,
     cancel_requested: Callable[[], bool] | None = None,
@@ -1410,15 +1230,6 @@ def prewarm_browser_pdf_renderer(
         return False
     renderer.prewarm(cancel_requested=cancel_requested)
     return True
-
-
-def get_pdf_source_cache() -> PdfSourceCache:
-    global _PDF_SOURCE_CACHE
-    with _PDF_SOURCE_CACHE_GUARD:
-        if _PDF_SOURCE_CACHE is None:
-            app_config = load_app_config()
-            _PDF_SOURCE_CACHE = PdfSourceCache(Path(app_config.cache_dir).expanduser())
-        return _PDF_SOURCE_CACHE
 
 
 atexit.register(close_browser_pdf_renderer)
@@ -1664,36 +1475,10 @@ def fetch_disclosures(
 def fetch_report_detail(session: DartSession, disclosure: Disclosure) -> tuple[str, list[AttachmentDoc], str]:
     raise_if_cancel_requested(session.cancel_requested)
     detail_url = f"/dsaf001/main.do?rcpNo={disclosure.rcp_no}"
-    cache = get_report_detail_cache()
-    cached_detail = cache.load(rcp_no=disclosure.rcp_no)
-    if cached_detail is not None:
-        if session.verbose:
-            print(f"[CACHE] detail hit {disclosure.rcp_no}", file=sys.stderr)
-        return detail_url, cached_detail.attachments, cached_detail.main_dcm_no
-
-    cache_lock = cache.acquire_entry_lock(
-        rcp_no=disclosure.rcp_no,
-        cancel_requested=session.cancel_requested,
-    )
-    try:
-        cached_detail = cache.load(rcp_no=disclosure.rcp_no)
-        if cached_detail is not None:
-            if session.verbose:
-                print(f"[CACHE] detail hit-after-wait {disclosure.rcp_no}", file=sys.stderr)
-            return detail_url, cached_detail.attachments, cached_detail.main_dcm_no
-
-        html_text = session.get_text(detail_url)
-        main_dcm_no = parse_main_dcm_no(html_text, disclosure.rcp_no)
-        attachments = parse_attachment_docs(html_text)
-        cache.store(
-            ReportDetail(main_dcm_no=main_dcm_no, attachments=attachments),
-            rcp_no=disclosure.rcp_no,
-        )
-        if session.verbose:
-            print(f"[CACHE] detail stored {disclosure.rcp_no}", file=sys.stderr)
-        return detail_url, attachments, main_dcm_no
-    finally:
-        cache_lock.release()
+    html_text = session.get_text(detail_url)
+    main_dcm_no = parse_main_dcm_no(html_text, disclosure.rcp_no)
+    attachments = parse_attachment_docs(html_text)
+    return detail_url, attachments, main_dcm_no
 
 
 def fetch_pdf_sources(
@@ -1706,82 +1491,48 @@ def fetch_pdf_sources(
     cancel_requested: Callable[[], bool] | None = None,
 ) -> list[PdfSource]:
     raise_if_cancel_requested(cancel_requested)
-    cache = get_pdf_source_cache()
-    renderer_mode = pdf_source_cache_renderer_variant()
-    cached_sources = cache.load(
-        rcp_no=rcp_no,
-        dcm_no=dcm_no,
-        label=label,
-        renderer_mode=renderer_mode,
-    )
-    if cached_sources is not None:
-        if session.verbose:
-            print(f"[CACHE] hit {rcp_no}/{dcm_no} {label} ({renderer_mode})", file=sys.stderr)
-        return cached_sources
-
-    cache_lock = cache.acquire_entry_lock(
-        rcp_no=rcp_no,
-        dcm_no=dcm_no,
-        label=label,
-        renderer_mode=renderer_mode,
-        cancel_requested=cancel_requested,
-    )
-    try:
-        cached_sources = cache.load(
-            rcp_no=rcp_no,
-            dcm_no=dcm_no,
-            label=label,
-            renderer_mode=renderer_mode,
-        )
-        if cached_sources is not None:
-            if session.verbose:
-                print(
-                    f"[CACHE] hit-after-wait {rcp_no}/{dcm_no} {label} ({renderer_mode})",
-                    file=sys.stderr,
-                )
-            return cached_sources
-
-        download_main_url = f"/pdf/download/main.do?rcp_no={rcp_no}&dcm_no={dcm_no}"
+    download_main_url = f"/pdf/download/main.do?rcp_no={rcp_no}&dcm_no={dcm_no}"
+    download_assets: list[DownloadAsset] = []
+    last_download_main_html = ""
+    for attempt in range(1, DOWNLOAD_LINK_RETRY_COUNT + 1):
+        raise_if_cancel_requested(cancel_requested)
         download_main_html = session.get_text(download_main_url, referer=detail_url)
+        last_download_main_html = download_main_html
         download_assets = parse_download_assets(download_main_html)
-        if not download_assets:
-            raise RuntimeError(f"다운로드 링크를 찾지 못했습니다: {download_main_url}")
+        if download_assets:
+            break
+        if attempt < DOWNLOAD_LINK_RETRY_COUNT:
+            sleep_with_cancellation(DOWNLOAD_LINK_RETRY_DELAY_SECONDS * attempt, cancel_requested)
+    if not download_assets:
+        summary = summarize_download_page(last_download_main_html)
+        if summary:
+            raise RuntimeError(f"다운로드 링크를 찾지 못했습니다: {download_main_url} ({summary})")
+        raise RuntimeError(f"다운로드 링크를 찾지 못했습니다: {download_main_url}")
 
-        sources: list[PdfSource] = []
-        for asset in download_assets:
-            raise_if_cancel_requested(cancel_requested)
-            if asset.kind == "pdf":
-                pdf_bytes = session.get_bytes(asset.path, referer=download_main_url)
-                if not pdf_bytes.startswith(b"%PDF"):
-                    raise RuntimeError(f"PDF 다운로드 실패: {asset.path}")
-                sources.append(PdfSource(bytes_data=pdf_bytes, label=label))
-                continue
+    sources: list[PdfSource] = []
+    for asset in download_assets:
+        raise_if_cancel_requested(cancel_requested)
+        if asset.kind == "pdf":
+            pdf_bytes = session.get_bytes(asset.path, referer=download_main_url)
+            if not pdf_bytes.startswith(b"%PDF"):
+                raise RuntimeError(f"PDF 다운로드 실패: {asset.path}")
+            sources.append(PdfSource(bytes_data=pdf_bytes, label=label))
+            continue
 
-            if asset.kind == "zip":
-                zip_bytes = session.get_bytes(asset.path, referer=download_main_url)
-                sources.extend(
-                    extract_pdf_sources_from_zip(
-                        zip_bytes,
-                        label=label,
-                        cancel_requested=cancel_requested,
-                    )
+        if asset.kind == "zip":
+            zip_bytes = session.get_bytes(asset.path, referer=download_main_url)
+            sources.extend(
+                extract_pdf_sources_from_zip(
+                    zip_bytes,
+                    label=label,
+                    cancel_requested=cancel_requested,
                 )
-                continue
+            )
+            continue
 
-            raise RuntimeError(f"지원하지 않는 다운로드 형식입니다: {asset.kind}")
+        raise RuntimeError(f"지원하지 않는 다운로드 형식입니다: {asset.kind}")
 
-        cache.store(
-            sources,
-            rcp_no=rcp_no,
-            dcm_no=dcm_no,
-            label=label,
-            renderer_mode=renderer_mode,
-        )
-        if session.verbose:
-            print(f"[CACHE] stored {rcp_no}/{dcm_no} {label} ({renderer_mode})", file=sys.stderr)
-        return sources
-    finally:
-        cache_lock.release()
+    return sources
 
 
 def header_text(disclosure: Disclosure) -> str:
@@ -1880,6 +1631,7 @@ def populate_output_pdf(
     session: DartSession,
     *,
     disclosures: list[Disclosure],
+    include_attachments: bool = True,
     log_stream=sys.stderr,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> None:
@@ -1894,8 +1646,10 @@ def populate_output_pdf(
         detail_url, attachments, main_dcm_no = fetch_report_detail(session, disclosure)
         disclosure.attachment_docs = attachments
         if log_stream is not None:
-            if attachments:
+            if include_attachments and attachments:
                 print(f"    본문 1건 + 첨부 {len(attachments)}건 처리 예정", file=log_stream)
+            elif attachments:
+                print(f"    본문만 처리 예정 (첨부 {len(attachments)}건 제외)", file=log_stream)
             else:
                 print("    본문만 처리 예정", file=log_stream)
             print("    본문 다운로드/병합 중...", file=log_stream)
@@ -1917,6 +1671,9 @@ def populate_output_pdf(
                 header=header_text(disclosure),
                 cancel_requested=cancel_requested,
             )
+
+        if not include_attachments:
+            continue
 
         for attachment_index, attachment in enumerate(attachments, start=1):
             raise_if_cancel_requested(cancel_requested)
@@ -1953,9 +1710,10 @@ def build_output_pdf(
     *,
     disclosures: list[Disclosure],
     output_path: Path,
+    include_attachments: bool = True,
     log_stream=sys.stderr,
     cancel_requested: Callable[[], bool] | None = None,
-) -> None:
+) -> Path:
     raise_if_cancel_requested(cancel_requested)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_doc = fitz.open()
@@ -1964,17 +1722,16 @@ def build_output_pdf(
             output_doc,
             session,
             disclosures=disclosures,
+            include_attachments=include_attachments,
             log_stream=log_stream,
             cancel_requested=cancel_requested,
         )
         raise_if_cancel_requested(cancel_requested)
-        if log_stream is not None:
-            print(f"[저장] 최종 PDF 저장 중... (총 {output_doc.page_count}페이지)", file=log_stream)
-        output_doc.save(
-            output_path,
-            garbage=4,
-            deflate=True,
-            clean=True,
+        return save_output_document(
+            output_doc,
+            output_path=output_path,
+            log_stream=log_stream,
+            cancel_requested=cancel_requested,
         )
     finally:
         output_doc.close()
@@ -1984,6 +1741,7 @@ def build_output_pdf_bytes(
     session: DartSession,
     *,
     disclosures: list[Disclosure],
+    include_attachments: bool = True,
     log_stream=sys.stderr,
     cancel_requested: Callable[[], bool] | None = None,
 ) -> bytes:
@@ -1994,6 +1752,7 @@ def build_output_pdf_bytes(
             output_doc,
             session,
             disclosures=disclosures,
+            include_attachments=include_attachments,
             log_stream=log_stream,
             cancel_requested=cancel_requested,
         )
@@ -2009,6 +1768,49 @@ def build_output_pdf_bytes(
         output_doc.close()
 
 
+def pdf_save_kwargs() -> dict[str, object]:
+    return {
+        "garbage": 4,
+        "deflate": True,
+        "clean": True,
+    }
+
+
+def save_pdf_bytes_atomic(output_path: Path, pdf_bytes: bytes) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_output_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent,
+            prefix=f"{output_path.stem}-",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_output_path = Path(temp_file.name)
+            temp_file.write(pdf_bytes)
+        os.replace(temp_output_path, output_path)
+        temp_output_path = None
+        return output_path
+    finally:
+        if temp_output_path is not None:
+            temp_output_path.unlink(missing_ok=True)
+
+
+def save_output_document(
+    output_doc: fitz.Document,
+    *,
+    output_path: Path,
+    log_stream=sys.stderr,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> Path:
+    raise_if_cancel_requested(cancel_requested)
+    if log_stream is not None:
+        print(f"[저장] 최종 PDF 저장 중... (총 {output_doc.page_count}페이지)", file=log_stream)
+
+    full_pdf_bytes = output_doc.tobytes(**pdf_save_kwargs())
+    return save_pdf_bytes_atomic(output_path, full_pdf_bytes)
+
+
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="DART 공시를 수집해 하나의 PDF로 병합합니다.",
@@ -2018,6 +1820,9 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--end-date", default=None, help="조회 종료일 (YYYY-MM-DD)")
     parser.add_argument("--output", default=None, help="저장할 PDF 전체 경로")
     parser.add_argument("--output-dir", default=None, help="자동 파일명을 저장할 폴더")
+    parser.add_argument("--include-attachments", action="store_true", help="첨부 문서도 PDF에 포함")
+    parser.add_argument("--split-max-mb", type=int, default=None, help="원본 PDF 저장 후 추가 분할 파일 생성 기준(MB)")
+    parser.add_argument("--no-split", action="store_true", help="추가 분할 파일을 만들지 않음")
     parser.add_argument("--limit", type=int, default=None, help="앞에서부터 지정 개수만 처리")
     parser.add_argument("--dry-run", action="store_true", help="메타데이터만 조회하고 PDF는 생성하지 않음")
     parser.add_argument("--no-prompt", action="store_true", help="CLI 입력 없이 옵션 또는 기본값 사용")
@@ -2035,6 +1840,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("시작일은 종료일보다 늦을 수 없습니다.")
     if args.limit is not None and args.limit < 1:
         raise SystemExit("--limit는 1 이상의 정수여야 합니다.")
+    if args.split_max_mb is not None and args.split_max_mb < 1:
+        raise SystemExit("--split-max-mb는 1 이상의 정수여야 합니다.")
 
 
 def to_user_friendly_error_message(error: RuntimeError) -> str:
@@ -2050,7 +1857,7 @@ def to_user_friendly_error_message(error: RuntimeError) -> str:
             "2. 호스팅 환경이라면 서버 위치나 클라우드 IP 대역을 바꿔 재시도\n"
             "3. 회사 VPN/프록시/보안SW가 켜져 있으면 잠시 해제 후 재시도\n"
             "4. 잠시 후 다시 시도\n"
-            "5. 같은 조건으로 다시 실행하면 이미 캐시된 공시는 재사용되어 앞부분 부담이 줄어듭니다\n"
+            "5. 긴 구간 조회라면 기간을 조금 좁혀 다시 시도\n"
             f"원본 오류: {message}"
         )
     return message
@@ -2090,12 +1897,27 @@ def main(argv: Iterable[str]) -> int:
                 )
             return 0
 
-        build_output_pdf(
+        saved_path = build_output_pdf(
             session,
             disclosures=batch.disclosures,
             output_path=Path(args.output),
+            include_attachments=args.include_attachments,
         )
-        print(f"완료: {args.output}", file=sys.stderr)
+        print(f"완료: {saved_path}", file=sys.stderr)
+        if args.split_max_mb is not None:
+            try:
+                import split_pdf_by_size
+
+                split_paths = split_pdf_by_size.split_pdf_file(
+                    saved_path,
+                    max_mb=args.split_max_mb,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    f"원본 PDF는 저장됐지만 추가 분할 파일 생성에 실패했습니다: {error}"
+                ) from error
+            for split_path in split_paths:
+                print(f"[분할] 완료: {split_path}", file=sys.stderr)
         return 0
     except RuntimeError as error:
         raise SystemExit(to_user_friendly_error_message(error)) from error
