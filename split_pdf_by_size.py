@@ -8,7 +8,11 @@ import re
 import sys
 import tempfile
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
+
+if TYPE_CHECKING:
+    import fitz as fitz_module
+    from pypdf import PdfReader as PdfReaderType, PdfWriter as PdfWriterType
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -59,25 +63,34 @@ def make_part_output_path(source_pdf: Path, part_number: int, output_dir: Path |
     return target_dir / f"{source_pdf.stem}-part{part_number:03d}{source_pdf.suffix}"
 
 
-def estimate_writer_size_bytes(writer: PdfWriter) -> int:
+def estimate_writer_size_bytes(writer: "PdfWriterType") -> int:
     bio = io.BytesIO()
     writer.write(bio)
     return bio.tell()
 
 
-def build_writer_for_range(reader: PdfReader, start_page: int, end_page: int) -> PdfWriter:
+def build_writer_for_range(
+    reader: "PdfReaderType",
+    start_page: int,
+    end_page: int,
+) -> "PdfWriterType":
     writer = PdfWriter()
     for page_number in range(start_page, end_page + 1):
         writer.add_page(reader.pages[page_number])
     return writer
 
 
-def estimate_range_size_bytes(reader: PdfReader, start_page: int, end_page: int) -> int:
+def estimate_range_size_bytes(reader: "PdfReaderType", start_page: int, end_page: int) -> int:
     writer = build_writer_for_range(reader, start_page, end_page)
     return estimate_writer_size_bytes(writer)
 
 
-def save_range_to_pdf(reader: PdfReader, start_page: int, end_page: int, output_pdf: Path) -> int:
+def save_range_to_pdf(
+    reader: "PdfReaderType",
+    start_page: int,
+    end_page: int,
+    output_pdf: Path,
+) -> int:
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
     writer = build_writer_for_range(reader, start_page, end_page)
     with output_pdf.open("wb") as file_obj:
@@ -105,7 +118,7 @@ def save_bytes_atomic(output_path: Path, data: bytes) -> int:
             temp_output_path.unlink(missing_ok=True)
 
 
-def build_fitz_range_bytes(source_doc: fitz.Document, start_page: int, end_page: int) -> bytes:
+def build_fitz_range_bytes(source_doc: "fitz_module.Document", start_page: int, end_page: int) -> bytes:
     part_doc = fitz.open()
     try:
         part_doc.insert_pdf(source_doc, from_page=start_page, to_page=end_page)
@@ -185,6 +198,9 @@ def split_pdf_by_size_pypdf(
     max_bytes: int,
     output_dir: Path | None = None,
 ) -> list[Path]:
+    if PdfReader is None or PdfWriter is None:
+        raise RuntimeError("pypdf가 설치되어 있지 않습니다.")
+
     reader = PdfReader(str(source_pdf), strict=False)
     if reader.is_encrypted and reader.decrypt("") == 0:
         raise RuntimeError(f"암호화된 PDF를 열 수 없습니다: {source_pdf}")
@@ -240,6 +256,9 @@ def split_pdf_by_size_fitz(
     max_bytes: int,
     output_dir: Path | None = None,
 ) -> list[Path]:
+    if fitz is None:
+        raise RuntimeError("PyMuPDF(fitz)가 설치되어 있지 않습니다.")
+
     with fitz.open(source_pdf) as source_doc:
         total_pages = source_doc.page_count
         size_cache: dict[tuple[int, int], int] = {}
