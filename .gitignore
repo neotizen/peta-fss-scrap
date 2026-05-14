@@ -205,3 +205,38 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# === claude-sean 글로벌 표준 (자동 배포) ===
+# 시스템·환경
+.DS_Store
+.venv/
+node_modules/
+__pycache__
+*.py[cod]
+
+# 자격증명·MCP 설정
+credentials/
+.mcp.json
+.clasp.json
+**/.clasp.json
+
+# 작업 폴더 (수령 원본·휴지통)
+source/
+_trash/
+
+# 워크스페이스 전역: 바이너리 산출물 제외 (.md만 추적)
+*.docx
+*.doc
+*.pdf
+*.gdoc
+*.gsheet
+*.xlsx
+*.xls
+*.csv
+*.pptx
+*.ppt
+*.zip
+*.png
+*.jpg
+*.jpeg
+# === claude-sean 글로벌 표준 끝 ===
